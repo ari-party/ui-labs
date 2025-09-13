@@ -1,11 +1,15 @@
 import Signal from "@rbxts/lemon-signal";
 import { LoadVirtualModule } from "./Utils";
+import { ScriptEditorService } from "@rbxts/services";
 
 const HttpService = game.GetService("HttpService");
 
 type Dependencies = Map<ModuleScript, { Result: unknown }>;
 type DependencyLoaders = Map<ModuleScript, Promise<unknown>>;
-type Listeners = Map<ModuleScript, RBXScriptConnection>;
+type Listeners = Map<
+	ModuleScript,
+	{ connections: RBXScriptConnection[]; threads: thread[] }
+>;
 
 export class Environment {
 	private _ActiveConnections = true;
@@ -57,11 +61,35 @@ export class Environment {
 	ListenDependency(module: ModuleScript) {
 		if (!this._ActiveConnections) return;
 
-		const listener = module.GetPropertyChangedSignal("Source").Connect(() => {
-			if (!this._ActiveConnections) return;
-			this.OnDependencyChanged.Fire(module);
+		let lastSource = ScriptEditorService.GetEditorSource(module);
+
+		const propertyListener = module
+			.GetPropertyChangedSignal("Source")
+			.Connect(() => {
+				if (!this._ActiveConnections) return;
+
+				const currentSource = module.Source;
+				if (currentSource !== lastSource) {
+					lastSource = currentSource;
+					this.OnDependencyChanged.Fire(module);
+				}
+			});
+
+		const checkThread = task.spawn(() => {
+			while (task.wait(1) && this._ActiveConnections) {
+				const currentSource = ScriptEditorService.GetEditorSource(module);
+				if (currentSource !== lastSource) {
+					lastSource = currentSource;
+					this.OnDependencyChanged.Fire(module);
+				}
+			}
 		});
-		this._Listeners.set(module, listener);
+
+		if (!this._Listeners.has(module)) {
+			this._Listeners.set(module, { connections: [], threads: [] });
+		}
+		this._Listeners.get(module)!.connections.push(propertyListener);
+		this._Listeners.get(module)!.threads.push(checkThread);
 	}
 
 	LoadDependency<T = unknown>(dependency: ModuleScript): Promise<T> {
@@ -95,8 +123,11 @@ export class Environment {
 		}
 
 		this._ActiveConnections = false;
-		this._Listeners.forEach((connection) => {
-			connection.Disconnect();
+		this._Listeners.forEach((module) => {
+			module.connections.forEach((connection) => {
+				connection.Disconnect();
+			});
+			module.threads.forEach(task.cancel);
 		});
 		this.OnDependencyChanged.Destroy();
 	}
